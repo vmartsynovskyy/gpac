@@ -350,6 +350,10 @@ struct __dash_group
 	Bool is_low_latency;
 
 	u32 hint_visible_width, hint_visible_height;
+
+	// PANDA
+	u32 last_target_dl_rate;
+	u32 smooth_last_target_dl_rate;
 };
 
 static void gf_dash_solve_period_xlink(GF_DashClient *dash, GF_List *period_list, u32 period_idx);
@@ -3034,6 +3038,14 @@ static void dash_store_stats(GF_DashClient *dash, GF_DASH_Group *group, u32 byte
 #endif
 }
 
+static GFINLINE void dash_set_min_wait(GF_DashClient *dash, u32 min_wait)
+{
+	if (!dash->min_wait_ms_before_next_request || (min_wait < dash->min_wait_ms_before_next_request)) {
+		dash->min_wait_ms_before_next_request = min_wait;
+		dash->min_wait_sys_clock = gf_sys_clock();
+	}
+}
+
 static s32 dash_do_rate_monitor_default(GF_DashClient *dash, GF_DASH_Group *group, u32 bits_per_sec, u64 total_bytes, u64 bytes_done, u64 us_since_start, u32 buffer_dur_ms, u32 current_seg_dur)
 {
 	Bool default_switch_mode;
@@ -3482,6 +3494,91 @@ static s32 bola_find_max_utility_index(GF_List *representations, Double V, Doubl
 
 /**
 Adaptation Algorithm as described in
+Z. Li et al. 2013: Probe and Adapt: Rate Adaptation for HTTP Video Streaming At Scale
+Arxiv.org
+*/
+static s32 dash_do_rate_adaptation_panda(GF_DashClient *dash, GF_DASH_Group *group, GF_DASH_Group *base_group,
+				         u32 dl_rate, Double speed, Double max_available_speed, Bool force_lower_complexity,
+					 GF_MPD_Representation *rep, Bool go_up_bitrate)
+{
+	// TODO: Don't start from lowest bitrate
+	s32 new_index = -1;
+
+	// PANDA variables
+	// probing convergence rate
+	Double K = 0.5;
+	// probing additive increase bitrate
+	u32 w = 100000;
+	// Buffer convergence rate
+	Double Beta = 0.2;
+
+	// EWMA alpha variable
+	Double alpha = 0.75;
+
+	u32 nb_reps;
+
+	nb_reps = gf_list_count(group->adaptation_set->representations);
+
+	// from equation (7)
+	long additive_increase = w - MAX(0, (int) group->last_target_dl_rate - (int) dl_rate);
+	GF_LOG(GF_LOG_DEBUG, GF_LOG_DASH,
+	       ("[DASH] PANDA: increase: %d last rate: %u dl_rate:%u\n",
+	       additive_increase,
+	       group->last_target_dl_rate,
+	       dl_rate));
+	u32 target_dl_rate = (long) (K * additive_increase) + (long) group->last_target_dl_rate;
+
+	// smoothing using EWMA
+	u32 smooth_target_dl_rate = alpha*target_dl_rate + (1-alpha) * group->smooth_last_target_dl_rate;
+
+	GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] PANDA: Target rate: %u Smooth rate: %u\n", target_dl_rate, smooth_target_dl_rate));
+
+	// quantize
+	u32 min_difference = -1;
+	for (u32 i = 0; i < nb_reps; i++) {
+	    GF_MPD_Representation *rep = gf_list_get(group->adaptation_set->representations, i);
+	    u32 bandwidth_difference = ABS(smooth_target_dl_rate - rep->bandwidth);
+
+	    if (bandwidth_difference < min_difference) {
+		min_difference = bandwidth_difference;
+		new_index = i;
+	    }
+	}
+
+	// scheduling
+	GF_MPD_Representation *result = gf_list_get(group->adaptation_set->representations, (u32)new_index);
+	if (smooth_target_dl_rate > 0) {
+	    // TODO: proper segment length
+	    Double duration;
+	    u32 nb_seg;
+	    gf_dash_get_segment_duration(result, group->adaptation_set, group->period, dash->mpd, &nb_seg, &duration);
+	    u32 seg_length_ms = duration * 1000;
+	    u32 bandwidth_ms = result->bandwidth / 1000;
+	    u32 expected_ms = bandwidth_ms * seg_length_ms / smooth_target_dl_rate;
+	    u32 buffer_ms = Beta * group->buffer_occupancy_ms - group->buffer_min_ms;
+	    u32 wait_ms = expected_ms + buffer_ms;
+	    GF_LOG(GF_LOG_DEBUG, GF_LOG_DASH,
+		    ("[DASH] PANDA: wait_ms: %u expected: %u buffer: %u seg_dur: %u\n",
+		     wait_ms,
+		     expected_ms,
+		     buffer_ms,
+		     seg_length_ms));
+	    dash_set_min_wait(dash, wait_ms);
+	}
+
+	group->last_target_dl_rate = target_dl_rate;
+	group->smooth_last_target_dl_rate = smooth_target_dl_rate;
+
+	if (new_index != -1) {
+		// increment the segment number for debug purposes
+		group->current_index++;
+		GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] PANDA: buffer %d ms, segment number %d, new quality %d with rate %d\n", group->buffer_occupancy_ms, group->current_index, new_index, result->bandwidth));
+	}
+	return new_index;
+}
+
+/**
+Adaptation Algorithm as described in
 K. Spiteri et al. 2016. BOLA: Near-Optimal Bitrate Adaptation for Online Videos
 Arxiv.org
 */
@@ -3499,6 +3596,7 @@ static s32 dash_do_rate_adaptation_bola(GF_DashClient *dash, GF_DASH_Group *grou
 	GF_MPD_Representation *min_rep;
 	GF_MPD_Representation *max_rep;
 	u32 nb_reps;
+	GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] BOLA: Hello world\n"));
 
 	if (dash->mpd->type != GF_MPD_TYPE_STATIC) {
 		GF_LOG(GF_LOG_ERROR, GF_LOG_DASH, ("[DASH] BOLA: Cannot be used for live MPD\n"));
@@ -4192,6 +4290,10 @@ GF_Err gf_dash_setup_groups(GF_DashClient *dash)
 		group->adaptation_set = set;
 		group->period = period;
 		group->bitstream_switching = (set->bitstream_switching || period->bitstream_switching) ? GF_TRUE : GF_FALSE;
+
+		// PANDA
+		group->last_target_dl_rate = 0;
+		group->smooth_last_target_dl_rate = 0;
 
 		seg_dur = 0;
 		nb_dependent_rep = 0;
@@ -5537,14 +5639,6 @@ typedef enum
 
 
 static DownloadGroupStatus dash_download_group_download(GF_DashClient *dash, GF_DASH_Group *group, GF_DASH_Group *base_group, Bool has_dep_following);
-
-static GFINLINE void dash_set_min_wait(GF_DashClient *dash, u32 min_wait)
-{
-	if (!dash->min_wait_ms_before_next_request || (min_wait < dash->min_wait_ms_before_next_request)) {
-		dash->min_wait_ms_before_next_request = min_wait;
-		dash->min_wait_sys_clock = gf_sys_clock();
-	}
-}
 
 /*TODO decide what is the best, fetch from another representation or ignore ...*/
 static DownloadGroupStatus on_group_download_error(GF_DashClient *dash, GF_DASH_Group *group, GF_DASH_Group *base_group, GF_Err e, GF_MPD_Representation *rep, char *new_base_seg_url, char *key_url, Bool has_dep_following)
@@ -7122,6 +7216,10 @@ void gf_dash_set_algo(GF_DashClient *dash, GF_DASHAdaptationAlgorithm algo)
 	case GF_DASH_ALGO_BOLA_U:
 	case GF_DASH_ALGO_BOLA_O:
 		dash->rate_adaptation_algo = dash_do_rate_adaptation_bola;
+		dash->rate_adaptation_download_monitor = dash_do_rate_monitor_default;
+		break;
+	case GF_DASH_ALGO_PANDA:
+		dash->rate_adaptation_algo = dash_do_rate_adaptation_panda;
 		dash->rate_adaptation_download_monitor = dash_do_rate_monitor_default;
 		break;
 	case GF_DASH_ALGO_NONE:

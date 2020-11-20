@@ -951,6 +951,8 @@ typedef enum {
 	GF_DASH_ALGO_BOLA_U,
 	/*! BOLA-O*/
 	GF_DASH_ALGO_BOLA_O,
+	/*! PANDA*/
+	GF_DASH_ALGO_PANDA,
 	/*! Custom*/
 	GF_DASH_ALGO_CUSTOM
 } GF_DASHAdaptationAlgorithm;
