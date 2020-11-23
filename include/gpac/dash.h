@@ -953,6 +953,8 @@ typedef enum {
 	GF_DASH_ALGO_BOLA_O,
 	/*! PANDA*/
 	GF_DASH_ALGO_PANDA,
+	/*! QUETRA*/
+	GF_DASH_ALGO_QUETRA,
 	/*! Custom*/
 	GF_DASH_ALGO_CUSTOM
 } GF_DASHAdaptationAlgorithm;

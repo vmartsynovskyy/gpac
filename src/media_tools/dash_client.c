@@ -354,6 +354,9 @@ struct __dash_group
 	// PANDA
 	u32 last_target_dl_rate;
 	u32 smooth_last_target_dl_rate;
+
+	// QUETRA
+	u32 last_dl_rate;
 };
 
 static void gf_dash_solve_period_xlink(GF_DashClient *dash, GF_List *period_list, u32 period_idx);
@@ -3492,6 +3495,86 @@ static s32 bola_find_max_utility_index(GF_List *representations, Double V, Doubl
 	return new_index;
 }
 
+static u64 factorial(u64 n) {
+    u64 curr_sum = 1;
+    for (u64 i = 2; i <= n; i++) {
+	curr_sum *= i;
+    }
+    return curr_sum;
+}
+
+/**
+Adaptation Algorithm as described in
+P. Yadav et al. 2017: QUETRA: A Queuing Theory Approach to DASH Rate Adaptation
+Arxiv.org
+*/
+static s32 dash_do_rate_adaptation_quetra(GF_DashClient *dash, GF_DASH_Group *group, GF_DASH_Group *base_group,
+				         u32 dl_rate, Double speed, Double max_available_speed, Bool force_lower_complexity,
+					 GF_MPD_Representation *rep, Bool go_up_bitrate)
+{
+	// TODO: Don't start from lowest bitrate
+	s32 new_index = -1;
+
+	u32 nb_reps;
+	nb_reps = gf_list_count(group->adaptation_set->representations);
+
+	// EWMA alpha set to 0.1 as suggested in the paper
+	Double alpha = 0.1;
+	group->last_dl_rate = (1 - alpha) * group->last_dl_rate + alpha * dl_rate;
+
+	Double buffer_occupancy = group->buffer_occupancy_ms / group->buffer_max_ms;
+	Double min_difference = INFINITY;
+
+	for (u32 r_i = 0; r_i < nb_reps; r_i++) {
+	    GF_MPD_Representation *rep = gf_list_get(group->adaptation_set->representations, r_i);
+	    // get the duration of a segment
+	    Double duration_s;
+	    u32 nb_seg;
+	    gf_dash_get_segment_duration(rep, group->adaptation_set, group->period, dash->mpd, &nb_seg, &duration_s);
+	    u32 duration_ms = duration_s * 1000;
+	    u32 buffer_capacity = group->buffer_max_ms / duration_ms;
+
+	    // use the download rate from the EWMA
+	    Double utilization = (Double) group->last_dl_rate / (Double) rep->bandwidth;
+
+	    Double x_i_sum = 0.0;
+	    Double last_sum = 0.0;
+	    for (u32 i = 0; i < buffer_capacity; i++) {
+		Double j_sum = 0.0;
+		for (u32 j = 0; j <= i; j++) {
+		   j_sum += pow(-1, j) * pow(i - j, j) * pow(utilization, j) * exp((i-j)*utilization) / factorial(j);
+		}
+		x_i_sum += j_sum;
+		if (i == buffer_capacity - 1) {
+		    last_sum = x_i_sum;
+		}
+	    }
+
+	    Double buffer_slack = x_i_sum / (1 + utilization * last_sum);
+
+	    Double difference = ABS(buffer_occupancy - buffer_slack);
+	    if (difference < min_difference) {
+		min_difference = difference;
+		new_index = r_i;
+	    }
+
+	    GF_LOG(GF_LOG_INFO, GF_LOG_DASH,
+		   ("[DASH] QUETRA: buffer_slack: %f \n",
+		   buffer_slack));
+	}
+	GF_LOG(GF_LOG_INFO, GF_LOG_DASH,
+	       ("[DASH] QUETRA: min_difference: %f \n",
+	       min_difference));
+
+	if (new_index != -1) {
+	    GF_MPD_Representation *result = gf_list_get(group->adaptation_set->representations, new_index);
+	    // increment the segment number for debug purposes
+	    group->current_index++;
+	    GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] QUETRA: buffer %d ms, segment number %d, new quality %d with rate %d\n", group->buffer_occupancy_ms, group->current_index, new_index, result->bandwidth));
+	}
+	return new_index;
+}
+
 /**
 Adaptation Algorithm as described in
 Z. Li et al. 2013: Probe and Adapt: Rate Adaptation for HTTP Video Streaming At Scale
@@ -4294,6 +4377,9 @@ GF_Err gf_dash_setup_groups(GF_DashClient *dash)
 		// PANDA
 		group->last_target_dl_rate = 0;
 		group->smooth_last_target_dl_rate = 0;
+
+		// QUETRA
+		group->last_dl_rate = 0;
 
 		seg_dur = 0;
 		nb_dependent_rep = 0;
@@ -7220,6 +7306,10 @@ void gf_dash_set_algo(GF_DashClient *dash, GF_DASHAdaptationAlgorithm algo)
 		break;
 	case GF_DASH_ALGO_PANDA:
 		dash->rate_adaptation_algo = dash_do_rate_adaptation_panda;
+		dash->rate_adaptation_download_monitor = dash_do_rate_monitor_default;
+		break;
+	case GF_DASH_ALGO_QUETRA:
+		dash->rate_adaptation_algo = dash_do_rate_adaptation_quetra;
 		dash->rate_adaptation_download_monitor = dash_do_rate_monitor_default;
 		break;
 	case GF_DASH_ALGO_NONE:

@@ -1658,6 +1658,7 @@ static GF_Err dashdmx_initialize(GF_Filter *filter)
 	else if (!strcmp(ctx->algo, "bolau")) algo = GF_DASH_ALGO_BOLA_U;
 	else if (!strcmp(ctx->algo, "bolao")) algo = GF_DASH_ALGO_BOLA_O;
 	else if (!strcmp(ctx->algo, "panda")) algo = GF_DASH_ALGO_PANDA;
+	else if (!strcmp(ctx->algo, "quetra")) algo = GF_DASH_ALGO_QUETRA;
 	else {
 #ifndef GPAC_HAS_QJS
 		GF_LOG(GF_LOG_ERROR, GF_LOG_DASH, ("[DASHDmx] No JS support, cannot use custom algo %s\n", ctx->algo));
