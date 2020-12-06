@@ -54,6 +54,7 @@ typedef enum {
 	GF_DASH_STATE_RUNNING,
 } GF_DASH_STATE;
 
+#define FESTIVE_K 20
 
 //shifts AST in the past(>0) or future (<0)  so that client starts request in the future or in the past
 //#define FORCE_DESYNC	4000
@@ -357,6 +358,13 @@ struct __dash_group
 
 	// QUETRA
 	u32 last_dl_rate;
+
+	// FESTIVE
+	u32 last_k_dl_rates[FESTIVE_K];
+	Bool did_switch_last_k[FESTIVE_K];
+	u32 num_dl_rates;
+	u32 num_bitrate_raise_reqs;
+	s32 ref_index;
 };
 
 static void gf_dash_solve_period_xlink(GF_DashClient *dash, GF_List *period_list, u32 period_idx);
@@ -3503,6 +3511,108 @@ static u64 factorial(u64 n) {
     return curr_sum;
 }
 
+static u32 harmonic_mean(u32 input[], u64 n) {
+    Double sum_reciprocals = 0.0;
+    for (u64 i = 0; i < n; i++) {
+	sum_reciprocals += 1.0/((Double)input[i]);
+    }
+    return ((Double) n) / sum_reciprocals;
+}
+
+static u32 num_true(Bool input[], u64 n) {
+    u32 num_true = 0;
+    for (u64 i = 0; i < n; i++) {
+	if (input[n]) {
+	    num_true++;
+	}
+    }
+    return num_true;
+}
+
+/**
+Adaptation Algorithm as described in
+J. Jiang et al. 2014: Improving Fairness, Efficiency, and Stability in HTTP-Based Adaptive Video Streaming With Festive
+ieee.org
+*/
+static s32 dash_do_rate_adaptation_festive(GF_DashClient *dash, GF_DASH_Group *group, GF_DASH_Group *base_group,
+					   u32 dl_rate, Double speed, Double max_available_speed, Bool force_lower_complexity,
+					   GF_MPD_Representation *rep, Bool go_up_bitrate)
+{
+	s32 curr_index = gf_list_find(group->adaptation_set->representations, rep);
+	s32 new_index = curr_index;
+	if (group->num_dl_rates == 0) {
+	    group->ref_index = curr_index;
+	}
+
+	GF_MPD_Representation *ref_rep = gf_list_get(group->adaptation_set->representations, group->ref_index);
+
+	u32 nb_reps;
+	nb_reps = gf_list_count(group->adaptation_set->representations);
+
+	group->last_k_dl_rates[group->num_dl_rates % FESTIVE_K] = dl_rate;
+	u32 curr_num_dl_rates = group->num_dl_rates;
+	group->num_dl_rates++;
+
+	// Don't switch bitrates until we have at least 5 samples
+	if (group->num_dl_rates < 5) {
+	    return new_index;
+	}
+
+	// parameter p from the paper
+	Double p = 0.85;
+
+	u32 b_estimated = harmonic_mean(group->last_k_dl_rates, MIN(group->num_dl_rates, FESTIVE_K));
+
+	if (b_estimated > rep->bandwidth) {
+	    group->num_bitrate_raise_reqs++;
+	    if (group->num_bitrate_raise_reqs >= group->ref_index) {
+		// increase reference bitrate by one level
+		group->ref_index = MIN(group->ref_index + 1, nb_reps - 1);
+		GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] FESTIVE: reference index increased to %d\n", group->ref_index));
+	    }
+	} else {
+	    group->num_bitrate_raise_reqs = 0;
+	    if (rep->bandwidth > (u32) (p * ((Double) b_estimated))) {
+		// decrease reference bitrate by one level
+		group->ref_index = MAX(group->ref_index - 1, 0);
+		GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] FESTIVE: reference index decreased to %d\n", group->ref_index));
+	    }
+	}
+
+	// alpha parameter from the paper
+	Double alpha = 12.0;
+	// number of bitrate changes in the last FESTIVE_K
+	u32 num_changes_in_last_k = num_true(group->did_switch_last_k, MIN(group->num_dl_rates, FESTIVE_K));
+	ref_rep = gf_list_get(group->adaptation_set->representations, group->ref_index);
+
+	Double b_ref_efficiency_cost = ABS(((Double) ref_rep->bandwidth) / ((Double) MIN(b_estimated, ref_rep->bandwidth)) - 1);
+	Double b_curr_efficiency_cost = ABS(((Double) rep->bandwidth) / ((Double) MIN(b_estimated, ref_rep->bandwidth)) - 1);
+
+	Double b_curr_stability_cost = pow(2.0, (Double) num_changes_in_last_k);
+	Double b_ref_stability_cost= b_curr_stability_cost + 1;
+	GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] FESTIVE: reference stab: %lf, curr stab: %lf\n", b_ref_stability_cost, b_curr_stability_cost));
+
+	Double b_ref_cost = b_ref_stability_cost + alpha * b_ref_efficiency_cost;
+	Double b_curr_cost = b_curr_stability_cost + alpha * b_curr_efficiency_cost;
+
+	GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] FESTIVE: reference cost: %lf, curr cost: %lf\n", b_ref_cost, b_curr_cost));
+	if (b_ref_cost < b_curr_cost) {
+	    GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] FESTIVE: switching from %d to %d\n", curr_index, group->ref_index));
+	    new_index = group->ref_index;
+	    group->did_switch_last_k[curr_num_dl_rates] = GF_TRUE;
+	} else {
+	    group->did_switch_last_k[curr_num_dl_rates] = GF_FALSE;
+	}
+
+	if (new_index != -1) {
+	    GF_MPD_Representation *result = gf_list_get(group->adaptation_set->representations, new_index);
+	    // increment the segment number for debug purposes
+	    group->current_index++;
+	    GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] FESTIVE: buffer %d ms, segment number %d, new quality %d with rate %d\n", group->buffer_occupancy_ms, group->current_index, new_index, result->bandwidth));
+	}
+	return new_index;
+}
+
 /**
 Adaptation Algorithm as described in
 P. Yadav et al. 2017: QUETRA: A Queuing Theory Approach to DASH Rate Adaptation
@@ -4380,6 +4490,10 @@ GF_Err gf_dash_setup_groups(GF_DashClient *dash)
 
 		// QUETRA
 		group->last_dl_rate = 0;
+
+		// FESTIVE
+		group->num_dl_rates = 0;
+		group->num_bitrate_raise_reqs = 0;
 
 		seg_dur = 0;
 		nb_dependent_rep = 0;
@@ -7310,6 +7424,10 @@ void gf_dash_set_algo(GF_DashClient *dash, GF_DASHAdaptationAlgorithm algo)
 		break;
 	case GF_DASH_ALGO_QUETRA:
 		dash->rate_adaptation_algo = dash_do_rate_adaptation_quetra;
+		dash->rate_adaptation_download_monitor = dash_do_rate_monitor_default;
+		break;
+	case GF_DASH_ALGO_FESTIVE:
+		dash->rate_adaptation_algo = dash_do_rate_adaptation_festive;
 		dash->rate_adaptation_download_monitor = dash_do_rate_monitor_default;
 		break;
 	case GF_DASH_ALGO_NONE:

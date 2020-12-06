@@ -955,6 +955,8 @@ typedef enum {
 	GF_DASH_ALGO_PANDA,
 	/*! QUETRA*/
 	GF_DASH_ALGO_QUETRA,
+	/*! FESTIVE*/
+	GF_DASH_ALGO_FESTIVE,
 	/*! Custom*/
 	GF_DASH_ALGO_CUSTOM
 } GF_DASHAdaptationAlgorithm;
