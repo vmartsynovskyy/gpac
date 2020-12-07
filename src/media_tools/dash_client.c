@@ -3549,11 +3549,12 @@ static s32 dash_do_rate_adaptation_festive(GF_DashClient *dash, GF_DASH_Group *g
 	u32 nb_reps;
 	nb_reps = gf_list_count(group->adaptation_set->representations);
 
+	// save this download rate observation
 	group->last_k_dl_rates[group->num_dl_rates % FESTIVE_K] = dl_rate;
 	u32 curr_num_dl_rates = group->num_dl_rates;
 	group->num_dl_rates++;
 
-	// Don't switch bitrates until we have at least 5 samples
+	// Don't switch bitrates until we have a minimum number of samples for the harmonic mean
 	if (group->num_dl_rates < 5) {
 	    return new_index;
 	}
@@ -3561,8 +3562,10 @@ static s32 dash_do_rate_adaptation_festive(GF_DashClient *dash, GF_DASH_Group *g
 	// parameter p from the paper
 	Double p = 0.85;
 
+	// calculate the harmonic mean of the last k download rates
 	u32 b_estimated = harmonic_mean(group->last_k_dl_rates, MIN(group->num_dl_rates, FESTIVE_K));
 
+	// check if current bitrate is higher or lower than the harmonic mean
 	if (b_estimated > rep->bandwidth) {
 	    group->num_bitrate_raise_reqs++;
 	    if (group->num_bitrate_raise_reqs >= group->ref_index) {
@@ -3572,6 +3575,7 @@ static s32 dash_do_rate_adaptation_festive(GF_DashClient *dash, GF_DASH_Group *g
 	    }
 	} else {
 	    group->num_bitrate_raise_reqs = 0;
+	    // use parameter p as extra padding to prevent unnecessary decreases in quality
 	    if (rep->bandwidth > (u32) (p * ((Double) b_estimated))) {
 		// decrease reference bitrate by one level
 		group->ref_index = MAX(group->ref_index - 1, 0);
@@ -3588,6 +3592,7 @@ static s32 dash_do_rate_adaptation_festive(GF_DashClient *dash, GF_DASH_Group *g
 	Double b_ref_efficiency_cost = ABS(((Double) ref_rep->bandwidth) / ((Double) MIN(b_estimated, ref_rep->bandwidth)) - 1);
 	Double b_curr_efficiency_cost = ABS(((Double) rep->bandwidth) / ((Double) MIN(b_estimated, ref_rep->bandwidth)) - 1);
 
+	// stability cost increases exponentially with bitrate changes
 	Double b_curr_stability_cost = pow(2.0, (Double) num_changes_in_last_k);
 	Double b_ref_stability_cost= b_curr_stability_cost + 1;
 	GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] FESTIVE: reference stab: %lf, curr stab: %lf\n", b_ref_stability_cost, b_curr_stability_cost));
@@ -3596,9 +3601,11 @@ static s32 dash_do_rate_adaptation_festive(GF_DashClient *dash, GF_DASH_Group *g
 	Double b_curr_cost = b_curr_stability_cost + alpha * b_curr_efficiency_cost;
 
 	GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] FESTIVE: reference cost: %lf, curr cost: %lf\n", b_ref_cost, b_curr_cost));
+	// switch to the reference bitrate if the cost is less than staying at the current bitrate
 	if (b_ref_cost < b_curr_cost) {
 	    GF_LOG(GF_LOG_INFO, GF_LOG_DASH, ("[DASH] FESTIVE: switching from %d to %d\n", curr_index, group->ref_index));
 	    new_index = group->ref_index;
+	    // keep track of number of bitrate changes in the last k samples
 	    group->did_switch_last_k[curr_num_dl_rates] = GF_TRUE;
 	} else {
 	    group->did_switch_last_k[curr_num_dl_rates] = GF_FALSE;
@@ -3622,7 +3629,6 @@ static s32 dash_do_rate_adaptation_quetra(GF_DashClient *dash, GF_DASH_Group *gr
 				         u32 dl_rate, Double speed, Double max_available_speed, Bool force_lower_complexity,
 					 GF_MPD_Representation *rep, Bool go_up_bitrate)
 {
-	// TODO: Don't start from lowest bitrate
 	s32 new_index = -1;
 
 	u32 nb_reps;
@@ -3647,6 +3653,7 @@ static s32 dash_do_rate_adaptation_quetra(GF_DashClient *dash, GF_DASH_Group *gr
 	    // use the download rate from the EWMA
 	    Double utilization = (Double) group->last_dl_rate / (Double) rep->bandwidth;
 
+	    // compute buffer slack using summation formula on page 3 of paper
 	    Double x_i_sum = 0.0;
 	    Double last_sum = 0.0;
 	    for (u32 i = 0; i < buffer_capacity; i++) {
@@ -3660,8 +3667,10 @@ static s32 dash_do_rate_adaptation_quetra(GF_DashClient *dash, GF_DASH_Group *gr
 		}
 	    }
 
+	    // calculate buffer slack
 	    Double buffer_slack = x_i_sum / (1 + utilization * last_sum);
 
+	    // use this quality level if buffer slack is the closest to the buffer occupancy
 	    Double difference = ABS(buffer_occupancy - buffer_slack);
 	    if (difference < min_difference) {
 		min_difference = difference;
@@ -3694,7 +3703,6 @@ static s32 dash_do_rate_adaptation_panda(GF_DashClient *dash, GF_DASH_Group *gro
 				         u32 dl_rate, Double speed, Double max_available_speed, Bool force_lower_complexity,
 					 GF_MPD_Representation *rep, Bool go_up_bitrate)
 {
-	// TODO: Don't start from lowest bitrate
 	s32 new_index = -1;
 
 	// PANDA variables
@@ -3741,7 +3749,6 @@ static s32 dash_do_rate_adaptation_panda(GF_DashClient *dash, GF_DASH_Group *gro
 	// scheduling
 	GF_MPD_Representation *result = gf_list_get(group->adaptation_set->representations, (u32)new_index);
 	if (smooth_target_dl_rate > 0) {
-	    // TODO: proper segment length
 	    Double duration;
 	    u32 nb_seg;
 	    gf_dash_get_segment_duration(result, group->adaptation_set, group->period, dash->mpd, &nb_seg, &duration);
@@ -3759,6 +3766,7 @@ static s32 dash_do_rate_adaptation_panda(GF_DashClient *dash, GF_DASH_Group *gro
 	    dash_set_min_wait(dash, wait_ms);
 	}
 
+	// update target rate and smoothed target rate for use in next iteration
 	group->last_target_dl_rate = target_dl_rate;
 	group->smooth_last_target_dl_rate = smooth_target_dl_rate;
 
